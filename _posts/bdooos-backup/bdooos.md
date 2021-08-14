@@ -1,0 +1,131 @@
+---
+title: 存档：bdooos赛题回忆
+date: 2020-09-07
+modified: 2021-08-14
+tags: [defcon,ctf]
+description:
+---
+
+> 去年写的这玩意，一直忘了发出来，图片都弄没了啊……今日再读，唏嘘不已。——elnx
+
+9号上午，gameboy放出没多久，新题bdooos上线了。
+
+题目还给出了一个网页，上面有一些题目基本描述，提供了ip端口等信息，但端口有很多。一时间不是很理解这个题目想让我们做什么。
+
+拿到文件看起来是一个arm64的kernel题，用户态程序console是rust写的。主办方并未给出启动脚本，我们的启动参数都是自行凭经验设置的：
+```
+qemu-system-aarch64 \
+    -M  virt \
+    -cpu cortex-a53 \
+    -smp 2 \
+    -m 512M \
+    -kernel ./image \
+    -nographic \
+    -append "root=/dev/ram0 rw rootfstype=ext4 console=ttyAMA0 init=/linuxrc ignore_loglevel" \
+    -initrd ./initrd
+```
+
+大家很快意识到这题有几个急需弄清楚的方向性问题：
+1. 如果漏洞在kernel中，如何利用？远程的启动脚本都没给，开了啥保护也不知道
+2. 如果真是内核题，需要diff找到考点在哪儿
+3. 如果是用户态的题目，需要尽快逆向这个rust的binary
+
+鸡哥之前准备了用于rust符号处理的IDA插件，这次派上了用场。
+
+大概明白如何启动之后，现场开始分工，一部分在逆向分析console，一部分分析kernel。
+
+retme大佬和懒爷爷在分析kernel，暂时没找到可疑的函数。
+
+bird、space等人在分析console。space指出，这个用户态程序的功能和预赛的floood很像。elnx找到一台arm64的实体机，可以动态调试console。很快，我们弄清楚了程序的大致功能：
+
+1. 需要root来抓IP包
+2. 程序会bind 0.0.0.0:33433 udp，这是一个client，后面用来发送log
+3. 启动子线程，上seccomp，负责recvfrom循环抓IP包
+4. 有个默认rules，可以添加，添加格式是bincode 的base64字符串，已经可以按需生成，里面内容就是源和目标的IP端口，以及一个正则表达式，类似iptables,正则表达式用来匹配包内容
+5. 匹配上的情况下，看log server是否设置，如果设置，从之前bind的socket发送数据到log server的udp 33433端口，内容是源目标ip端口，还有包内容，并且更新alerts，产生类似日志的效果。
+6. 还有个功能是detector
+7. reset直接退出
+
+
+console里有很显眼的seccomp设置，利用rust自带的功能，可以得到这份syscall白名单：
+```
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=exit_group
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=futex
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=ioctl
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=munmap
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=ppoll
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=read
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=recvfrom
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=rt_sigaction
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=rt_sigreturn
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=sendto
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=setsockopt
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=sigaltstack
+[2020-08-09T01:38:48Z DEBUG syscallz] seccomp: setting action=Allow syscall=write
+```
+
+抽象的事情来了，在正则匹配部分，rust的正则编译过程会用到getrandom调用，会直接触发这个seccomp导致挂掉。
+
+![](https://hackmd.sinku.me/uploads/upload_2f31fc4b1414e4d8c9db3dfad20b8142.png)
+
+
+在detector设置部分，也有个非常奇怪的问题，即遇到匹配的包后，console会执行之前设置的detector数据，这好像是shellcode？但数据都在堆上，不可执行，并且这还有seccomp的限制。
+
+到这里，大家心中疑问更多了：
+1. 题目描述中说flag在/flag，那么至少应该能open read write，但白名单中没有open，如何开文件？
+2. 用户态没法开文件，那么应该是kernel漏洞了，但这是要在kernel里面做open read write？
+3. 题目描述给出了一堆端口可供连接，看起来我们是只能发udp包给目标环境，就算console有漏洞有什么用？主办方还特意指出这题不会提供流量
+4. 主办方是否会通过网络把flag发到虚拟机中的/flag位置，是不是要我们写rules来把含有flag内容的网络包抓出来？但这样也只能抓到我们自己的，其他队伍的如何弄？
+
+主办方提到说这题没有SLA分数，如果服务down了会直接把flag内容放到网页端部分。space很快写了一个脚本去遍历所有队伍的网页端，看是否有flag内容，到了12点左右，space成功拿到一个flag！大家惊喜之余发现flag提交不了，赶紧发ticket询问。
+
+13:26左右，space成功提交了一个抓到的flag，主办方提示我们拿到了first blood！
+
+分析console的工作还在继续，ripples指出如果正则导致挂掉可以想办法绕过编译过程，经过测试，输入不合法的正则表达式就可以跳过这个getrandom调用，但这样rules无法发挥作用，也就匹配不出包的内容了。
+
+晚饭过后感觉实质进展还是不大，眼看着11点就会开始最终一轮，这题非常关键，但我们还是没弄清楚考点在哪里。在服务关闭期间，我们连接会得到`ncat: no such file or dir`的消息，elnx搜索之后指出，远程应该是通过virt-manager搭建的虚拟机环境。
+
+到了11点开启服务，看到场上没有人开始攻击这道题，大家稍微松了口气，继续分析。space尝试了之前绕过getrandom的方法，虽然拿不到包的内容，但可以看到连接的ip端口：
+
+![](https://hackmd.sinku.me/uploads/upload_5478318878212462638b0f65b3efb707.png)
+
+同时，neoni、懒爷爷发现现在提供的附件下载下来的hash和之前拿到的不同，赶紧发ticket问主办方，主办方确认了这个情况，说远程仍然部署的是之前的附件。
+![](https://hackmd.sinku.me/uploads/upload_60b650b9f4bcf149c9a3348d9058f959.png)
+
+
+又过了一个小时，retme突然发现kernel的__sys_socket部分代码有点奇怪：
+![](https://hackmd.sinku.me/uploads/upload_de0ee3efd8c94e5018a536463b07d30b.png)
+
+实际上就在之前懒爷爷diff出来的结果中，但早上没觉得这部分代码会有问题就忽视了。总之是山重水复疑无路，柳暗花明又一村！大家恍然大悟：漏洞极有可能就藏在kernel里，而且就在处理网络通信的部分！之前的所有疑问都有了答案。
+
+时间来到8月10日00:00，整个房间的氛围非常紧张。
+
+
+大家都开始仔细分析console、kernel的交互逻辑，jackyxty和bird开始着手编写shellcode，基本想法就是匹配网络分包中是否有flag，匹配到就发回我们自己的服务器。hzshang、elnx在内核调试编写发送符合要求的网络包的代码。
+
+拷贝到用户态的代码相当于一个默认的detecor，detector在收到任意包时都会调用。这里的magicnumber和我们在console里看到的一个magicnumber完全对应上了。所以之前在arm64实体机上的动态调试分析出来的逻辑是不太对的，因为那就是普通linux内核，不是题目里有漏洞的kernel。
+![](https://hackmd.sinku.me/uploads/upload_578532e14fe3546a86019fdd3ab064a4.png)
+
+大家都很紧张，一起分析并不断讨论，3:17左右，elnx给出了一份可用的POC：
+
+```python
+from pwn import p64, p32, p16, p8, flat, asm
+import socket
+
+s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.bind(('192.168.99.2', 3333))
+s.connect(('192.168.99.3', 22))
+sc = asm('mov x0, 0; ret', arch='aarch64')
+payload = p64(0x8E1964418E9839FF) + sc + p64(0x7073736CE08CBFAC) + chr(0xf) + flat([192, 168, 99, 2], word_size=8) + p32(55555, endian='big')
+s.send(payload)
+```
+
+同时，初版shellcode也准备好了，但本地调试遇到问题，冷静单步分析发现是返回地址存在寄存器中，ret的目标是shellcode固定偏移处。稍加修改shellcode之后，可以开始攻击全场！但场上各种down，导致我们攻击打出来的flag会被别人捡到。space、ripples在监控我们自己的服务器和logserver，jackyxty、xhj、bird等人继续优化shellcode。很长一段时间我们都收不到有效的flag，多次发ticket问询。
+
+4:34，主办方再次提示大家去捡SLA flag。
+
+没多久，主办方提示我们拿到了真正的first blood。
+
+我们很快意识到这有KoH的成分：因为这道题的攻击可以给别人的程序种一个有持久性的后门，通过各种检测手段，你的shellcode可以禁止其他人的攻击，同时给自己发送flag。之后的重点就是优化shellcode，避免别人宕机。
+
+jackyxty很快做了一个心跳包功能出来，可以即时检测场上情况。xhj、bird、elnx等人猜测了很多主办方的check逻辑，ripples、space一直在监控场上情况，jackyxty负责修改shellcode，但效果不如人意，仍然有大量宕机情况。这一过程一直持续到比赛结束。
